@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"os"
 	"os/exec"
 	"strconv"
@@ -21,18 +20,18 @@ import (
 )
 
 func main() {
-	awsProfile := flag.String("awsProfile", "default", "a string")
-	region := flag.String("region", "us-east-1", "a string")
-	bucket := flag.String("bucket", "laptop-db", "a string")
+	awsProfile := flag.String("awsProfile", "default", "AWS profile to use for uploading/downloading to/from S3")
+	region := flag.String("region", "us-east-1", "AWS region to use")
+	bucket := flag.String("bucket", "laptop-db", "AWS S3 Bucket name to use for uploading/downloading Snapshots/Backups")
 	command := flag.String("command", "backup", "backup/restore")
-	days := flag.Int("days", 0, "days from now to restore")
-	// host := flag.String("host", "127.0.0.1", "a string")
-	// username := flag.String("username", "cassandra", "a string")
-	// password := flag.String("password", "cassandra", "a string")
-	keyspace := flag.String("keyspace", "", "a string")
-	incremental := flag.Bool("incremental", false, "a bool")
-	cassandraDataDir := flag.String("cassandraDataDir", "/var/lib/cassandra/data", "a path")
-	restoreDataDir := flag.String("restoreDataDir", "/tmp/data", "a path")
+	days := flag.Int("days", 0, "days from now to restore, required only for restore, default 0 days")
+	host := flag.String("host", "127.0.0.1", "Cassandra host IP")
+	username := flag.String("username", "cassandra", "Cassandra username")
+	password := flag.String("password", "cassandra", "Cassandra Password")
+	keyspace := flag.String("keyspace", "", "Keyspace to backup/restore, leave empty for all keyspaces")
+	incremental := flag.Bool("incremental", false, "a bool indicating if incremental backup needs to be taken or snapshot")
+	cassandraDataDir := flag.String("cassandraDataDir", "/var/lib/cassandra/data", "a path indicating actual data directory for cassandra installation")
+	restoreDataDir := flag.String("restoreDataDir", "/tmp/data", "a temporary path to download restorable snapshots")
 
 	flag.Parse()
 
@@ -63,7 +62,7 @@ func main() {
 			}
 			fmt.Print(resp)
 		} else {
-			resp, err := FullSnapshot(svcS3, *cassandraDataDir, *bucket, uploader, *keyspace)
+			resp, err := FullSnapshot(svcS3, *cassandraDataDir, *bucket, uploader, *keyspace, *host, *username, *password)
 			if err != nil {
 				fmt.Print(err.Error())
 			}
@@ -80,6 +79,7 @@ func main() {
 
 }
 
+// RestoreByDays downloads the snapshots and backups by keyspace or all keyspaces
 func RestoreByDays(svcS3 *s3.S3, cassandraDataDir string, bucket string, downloader *s3manager.Downloader, keyspace string, days int) (string, error) {
 	now := time.Now()
 	t := now.AddDate(0, 0, -days)
@@ -105,7 +105,7 @@ func RestoreByDays(svcS3 *s3.S3, cassandraDataDir string, bucket string, downloa
 			fmt.Println(localDir)
 			err := os.MkdirAll(localDir, 0777)
 			if err != nil {
-				log.Fatal("error creating "+localDir, err.Error())
+				return "", err
 			}
 
 			fileName := cassandraDataDir + "/" + localKey
@@ -128,8 +128,8 @@ func RestoreByDays(svcS3 *s3.S3, cassandraDataDir string, bucket string, downloa
 			go func() {
 				gr, err := gzip.NewReader(resp.Body)
 				if err != nil {
-					log.Fatal("error creating new gzip reader")
-					os.Exit(1)
+					fmt.Print(err.Error())
+					return
 				}
 				io.Copy(writer, gr)
 				gr.Close()
@@ -162,35 +162,34 @@ func RestoreByDays(svcS3 *s3.S3, cassandraDataDir string, bucket string, downloa
 	return "", nil
 }
 
+// IncrementalSnapshot takes the backup by keyspace or all keyspaces
 func IncrementalSnapshot(svcS3 *s3.S3, cassandraDataDir string, bucket string, uploader *s3manager.Uploader, keyspace string) (string, error) {
 	resp, err := GetBackupFilesForUpload(cassandraDataDir, keyspace)
 	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
+		return "", err
 	}
 
 	_, err = S3UploadFiles(svcS3, cassandraDataDir, resp, bucket, uploader)
 	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
+		return "", err
 	}
 
 	err = ClearBackups(resp)
 	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
+		return "", err
 	}
 
 	return "", nil
 }
 
-func FullSnapshot(svcS3 *s3.S3, cassandraDataDir string, bucket string, uploader *s3manager.Uploader, keyspace string) (string, error) {
+// FullSnapshot takes the snapshot by keysapce or all keyspaces
+func FullSnapshot(svcS3 *s3.S3, cassandraDataDir string, bucket string, uploader *s3manager.Uploader, keyspace string, host string, username string, password string) (string, error) {
 	tag := strconv.FormatInt(time.Now().Unix(), 10)
 	var command string
 	if keyspace != "" {
-		command = "nodetool snapshot -t " + tag + " " + keyspace
+		command = "nodetool -u " + username + " -pw " + password + " -h " + host + " snapshot -t " + tag + " " + keyspace
 	} else {
-		command = "nodetool snapshot -t " + tag
+		command = "nodetool -u " + username + " -pw " + password + " -h " + host + " snapshot -t " + tag
 	}
 	cmd := exec.Command("/bin/sh", "-c", command)
 	var out bytes.Buffer
@@ -198,35 +197,33 @@ func FullSnapshot(svcS3 *s3.S3, cassandraDataDir string, bucket string, uploader
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	fmt.Println(command)
 	if err != nil {
-		fmt.Println(fmt.Sprint(err) + ": " + stderr.String())
-		os.Exit(1)
+		return "", err
 	}
 	fmt.Println("Result: " + out.String())
 
 	resp, err := GetSnapshotFilesForUpload(cassandraDataDir, tag)
 	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
+		return "", err
 	}
 
 	_, err = S3UploadFiles(svcS3, cassandraDataDir, resp, bucket, uploader)
 	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
+		return "", err
 	}
 
-	err = ClearSnapshots(tag)
+	err = ClearSnapshots(tag, host, username, password)
 	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
+		return "", err
 	}
 
 	return tag, nil
 }
 
-func ClearSnapshots(tag string) error {
-	command := "nodetool clearsnapshot -t " + tag
+// ClearSnapshots deletes the snapshot by the tag
+func ClearSnapshots(tag string, host string, username string, password string) error {
+	command := "nodetool clearsnapshot -u " + username + " -pw " + password + " -h " + host + " -t " + tag
 	cmd := exec.Command("/bin/sh", "-c", command)
 	var out bytes.Buffer
 	var stderr bytes.Buffer
@@ -234,46 +231,46 @@ func ClearSnapshots(tag string) error {
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil {
-		fmt.Println(fmt.Sprint(err) + ": " + stderr.String())
-		os.Exit(1)
+		return err
 	}
 	fmt.Println("Result: " + out.String())
 	return nil
 }
 
+// ClearBackups deletes the files uploaded from Backups directory
 func ClearBackups(files []string) error {
 	for _, file := range files {
 		err := os.RemoveAll(file)
 		if err != nil {
-			fmt.Print(err.Error())
+			return err
 		}
 	}
 	return nil
 }
 
+// GetSnapshotFilesForUpload gets the list of files to be uploaded from the cassandra snapshot directory
 func GetSnapshotFilesForUpload(cassandraDataDir string, tag string) ([]string, error) {
 	paths := []string{}
 
 	keyspaces, err := ioutil.ReadDir(cassandraDataDir)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	for _, keyspace := range keyspaces {
 		tables, err := ioutil.ReadDir(cassandraDataDir + "/" + keyspace.Name())
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
 		for _, table := range tables {
 			snapshots, err := ioutil.ReadDir(cassandraDataDir + "/" + keyspace.Name() + "/" + table.Name() + "/snapshots")
 			if err != nil {
 				continue
-				log.Fatal(err)
 			}
 			for _, snapshot := range snapshots {
 				if snapshot.Name() == tag {
 					files, err := ioutil.ReadDir(cassandraDataDir + "/" + keyspace.Name() + "/" + table.Name() + "/" + "snapshots/" + snapshot.Name())
 					if err != nil {
-						log.Fatal(err)
+						return nil, err
 					}
 					for _, file := range files {
 						paths = append(paths, cassandraDataDir+"/"+keyspace.Name()+"/"+table.Name()+"/"+"snapshots/"+snapshot.Name()+"/"+file.Name())
@@ -286,24 +283,24 @@ func GetSnapshotFilesForUpload(cassandraDataDir string, tag string) ([]string, e
 	return paths, nil
 }
 
-func GetBackupFilesForUpload(cassandraDataDir string, keyspace_input string) ([]string, error) {
+// GetBackupFilesForUpload Gets list of files to be uploaded from the cassandra backups directory
+func GetBackupFilesForUpload(cassandraDataDir string, keyspaceInput string) ([]string, error) {
 	paths := []string{}
 
 	keyspaces, err := ioutil.ReadDir(cassandraDataDir)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	for _, keyspace := range keyspaces {
-		if keyspace_input == "" || keyspace_input == keyspace.Name() {
+		if keyspaceInput == "" || keyspaceInput == keyspace.Name() {
 			tables, err := ioutil.ReadDir(cassandraDataDir + "/" + keyspace.Name())
 			if err != nil {
-				log.Fatal(err)
+				return nil, err
 			}
 			for _, table := range tables {
 				files, err := ioutil.ReadDir(cassandraDataDir + "/" + keyspace.Name() + "/" + table.Name() + "/backups")
 				if err != nil {
 					continue
-					log.Fatal(err)
 				}
 				for _, file := range files {
 					paths = append(paths, cassandraDataDir+"/"+keyspace.Name()+"/"+table.Name()+"/"+"backups/"+file.Name())
@@ -315,6 +312,7 @@ func GetBackupFilesForUpload(cassandraDataDir string, keyspace_input string) ([]
 	return paths, nil
 }
 
+// S3UploadFiles calls S3UploadFile to upload all files
 func S3UploadFiles(svcS3 *s3.S3, cassandraDataDir string, files []string, bucket string, uploader *s3manager.Uploader) (string, error) {
 	for _, file := range files {
 		err := S3UploadFile(svcS3, file, bucket, uploader)
@@ -325,6 +323,7 @@ func S3UploadFiles(svcS3 *s3.S3, cassandraDataDir string, files []string, bucket
 	return "", nil
 }
 
+// S3UploadFile compresses file and uploads to the specified S3 bucket
 func S3UploadFile(svcS3 *s3.S3, file string, bucket string, uploader *s3manager.Uploader) error {
 	t := time.Now()
 	fmt.Printf("Uploading %s", file)
